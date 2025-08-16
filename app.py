@@ -1,65 +1,104 @@
-# 置頂：匯入 + Token 驗證
-import os, time
-from fastapi import FastAPI, Header, HTTPException
+# app.py
+import os, time, json, sqlite3, uuid
+from typing import List, Dict, Any, Optional
+from fastapi import FastAPI, Request, HTTPException, Header, Query
 from pydantic import BaseModel
-from typing import Optional, List
-from storage import search_memory, add_memory
 
-AUTH_TOKEN = os.getenv("AUTH_TOKEN", "")
+DB_PATH = os.getenv("DB_PATH", "data/memory.db")
+AUTH_TOKEN = os.getenv("AUTH_TOKEN", "changeme")
+
 app = FastAPI(title="OathLink Backend")
 
-def _check(token: str | None):
-    if not AUTH_TOKEN:
-        return
-    if token != AUTH_TOKEN:
+# --- storage helpers ---
+def _ensure_dir(path: str):
+    d = os.path.dirname(path)
+    if d and not os.path.exists(d):
+        os.makedirs(d, exist_ok=True)
+
+def get_conn() -> sqlite3.Connection:
+    _ensure_dir(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS memories(
+      id TEXT PRIMARY KEY,
+      content TEXT NOT NULL,
+      tags TEXT NOT NULL,
+      ts REAL NOT NULL
+    )
+    """)
+    conn.commit()
+    return conn
+
+CONN = get_conn()
+
+def add_memory(content: str, tags: Optional[List[str]] = None) -> str:
+    mid = str(uuid.uuid4())
+    ts = time.time()
+    tags_json = json.dumps(tags or [])
+    CONN.execute("INSERT INTO memories(id,content,tags,ts) VALUES(?,?,?,?)",
+                 (mid, content, tags_json, ts))
+    CONN.commit()
+    return mid
+
+def search_memory(q: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    q_like = f"%{q}%"
+    rows = CONN.execute(
+        "SELECT id, content, tags, ts FROM memories "
+        "WHERE content LIKE ? OR tags LIKE ? ORDER BY ts DESC LIMIT ?",
+        (q_like, q_like, top_k)
+    ).fetchall()
+    out = []
+    for rid, content, tags_json, ts in rows:
+        try:
+            tags = json.loads(tags_json) if tags_json else []
+        except Exception:
+            tags = []
+        out.append({"id": rid, "content": content, "tags": tags, "ts": ts})
+    return out
+
+# --- auth guard ---
+def require_auth(x_auth_token: str | None):
+    if AUTH_TOKEN and (x_auth_token is None or x_auth_token != AUTH_TOKEN):
         raise HTTPException(status_code=401, detail="Unauthorized")
-from fastapi import FastAPI
-from pydantic import BaseModel
-from typing import List, Optional
-import time
 
-from storage import add_memory, search_memory, health as db_health
-
-app = FastAPI()
-
-class MemoryWrite(BaseModel):
+# --- models ---
+class WriteBody(BaseModel):
     content: str
     tags: Optional[List[str]] = None
 
-@app.get("/health")
-def health():
-    return {"ok": True, "ts": time.time(), "db": db_health()}
-
-@app.post("/memory/write")
-def memory_write(payload: ComposeReq, x_auth_token: str | None = Header(default=None)):
-    _check(x_auth_token)
-    mid = add_memory(payload.input, payload.tags or [])
-    return {"ok": True, "id": mid}
-
-@app.get("/memory/search")
-def memory_search(q: str, top_k: int = 5, x_auth_token: str | None = Header(default=None)):
-    _check(x_auth_token)
-    return {"results": search_memory(q, top_k)}
-# 新增：/compose（人格 + 記憶注入，回傳 prompt）
-PERSONA = "【人格模板】稱呼使用師父/您/願主；先結論後理由；禁止廢話與不敬語。"
-
-class ComposeReq(BaseModel):
+class ComposeBody(BaseModel):
     input: str
     tags: Optional[List[str]] = None
     top_k: int = 5
 
+# --- routes ---
+@app.get("/health")
+def health():
+    return {"ok": True, "ts": time.time()}
+
+@app.post("/memory/write")
+def memory_write(body: WriteBody, x_auth_token: str | None = Header(default=None, alias="X-Auth-Token")):
+    require_auth(x_auth_token)
+    mid = add_memory(body.content, body.tags)
+    return {"ok": True, "id": mid}
+
+@app.get("/memory/search")
+def memory_search(q: str = Query(...), top_k: int = Query(5), x_auth_token: str | None = Header(default=None, alias="X-Auth-Token")):
+    require_auth(x_auth_token)
+    hits = search_memory(q, top_k)
+    return {"results": hits, "ok": True, "ts": time.time()}
+
+# 這就是您現在缺少的端點
+PERSONA = os.getenv("PERSONA_PROMPT", "你是 OathLink 助理，語氣穩定、精簡、禮貌，回覆使用者偏好。")
 @app.post("/compose")
-def compose(req: ComposeReq, x_auth_token: str | None = Header(default=None)):
-    _check(x_auth_token)
-    hits = search_memory(req.input, req.top_k)
-    ctx = "\n".join([f"- {h['content']}" for h in hits]) or "- (無)"
-    prompt = f"""{PERSONA}
-
-【相關記憶】
-{ctx}
-
-【當前輸入】
-{req.input}
-
-【請以人格口吻輸出】"""
-    return {"prompt": prompt, "mem_hits": hits}
+def compose(body: ComposeBody, x_auth_token: str | None = Header(default=None, alias="X-Auth-Token")):
+    require_auth(x_auth_token)
+    hits = search_memory(body.input, body.top_k)
+    memory_block = "\n".join([f"- {h['content']}" for h in hits]) or "- （無匹配記憶）"
+    prompt = (
+        f"{PERSONA}\n\n"
+        f"【相關記憶】\n{memory_block}\n\n"
+        f"【使用者輸入】\n{body.input}\n\n"
+        f"請根據人格與相關記憶回覆。"
+    )
+    return {"ok": True, "prompt": prompt, "hits": hits, "ts": time.time()}
