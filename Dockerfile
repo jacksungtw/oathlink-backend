@@ -1,21 +1,29 @@
-# 依需要可改成 python:3.11-slim
+# Python 3.11 slim image
 FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PORT=8080 \
+    DB_PATH=/app/data/memory.db
 
 WORKDIR /app
 
-# 輕量安裝系統依賴（如需）
+# system deps (optional but safe)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    && rm -rf /var/lib/apt/lists/*
+    build-essential curl ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 
-# 先複製需求再安裝，利用快取
+# install python deps
 COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
-# 再把程式碼放進去
+# copy code
 COPY app.py storage.py /app/
 
-# Railway 會注入 $PORT，這裡只標註 8080 以利本地測試
+# ensure data dir exists (for SQLite)
+RUN mkdir -p /app/data
+
 EXPOSE 8080
 
-# 這行只是文檔化；真正啟動由 railway.json 的 startCommand 控制
-CMD ["python", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
+# Railway 會帶入 $PORT；本地預設 8080
+CMD ["sh", "-c", "python -m uvicorn app:app --host 0.0.0.0 --port ${PORT:-8080}"]
