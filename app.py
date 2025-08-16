@@ -1,128 +1,151 @@
 # app.py
-from fastapi import FastAPI, HTTPException, Header, Query
-from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Dict, Any, Optional
-import os, sqlite3, uuid, time, json
+import os
+import time
+from typing import List, Optional, Dict, Any
 
-# ---------- 基本設定 ----------
-AUTH_TOKEN = os.getenv("AUTH_TOKEN", "<jacksungtw>")  # 與您測試用的一致
-DB_PATH    = os.getenv("DB_PATH", "data/memory.db")
+from fastapi import FastAPI, Header, HTTPException, Query
+from pydantic import BaseModel
 
-app = FastAPI(title="OathLink Backend", version="1.0.0")
+# 本地簡易儲存（SQLite）——已在您的 storage.py 實作
+import storage
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+# --- 可選：OpenAI（若未設 OPENAI_API_KEY 會自動跳過） ---
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+USE_OPENAI = bool(OPENAI_API_KEY)
+if USE_OPENAI:
+    try:
+        from openai import OpenAI
+        oai_client = OpenAI(api_key=OPENAI_API_KEY)
+    except Exception:
+        USE_OPENAI = False
+
+# 服務啟動
+app = FastAPI(
+    title="OathLink 後端",
+    version="0.1.0",
+    description="固定語風 + 持久化記憶 + 可替換引擎 的極簡後端"
 )
 
-# ---------- SQLite ----------
-def _ensure_dir(path: str):
-    d = os.path.dirname(path)
-    if d and not os.path.exists(d):
-        os.makedirs(d, exist_ok=True)
-
-def get_conn() -> sqlite3.Connection:
-    _ensure_dir(DB_PATH)
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS memories(
-        id TEXT PRIMARY KEY,
-        content TEXT NOT NULL,
-        tags TEXT NOT NULL,
-        ts REAL NOT NULL
-    )
-    """)
-    conn.commit()
-    return conn
-
-CONN = get_conn()
-
-# ---------- 小工具 ----------
-def must_auth(x_auth_token: Optional[str]):
-    if AUTH_TOKEN and x_auth_token != AUTH_TOKEN:
+# ---- 簡單權杖驗證（與您現有流程一致） ----
+EXPECTED_TOKEN = os.getenv("X_AUTH_TOKEN", "")  # 您在 Railway 設定的變數
+def _check_token(x_auth_token: Optional[str]):
+    if EXPECTED_TOKEN and x_auth_token != EXPECTED_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-def add_memory(content: str, tags: Optional[List[str]]) -> str:
-    mid = str(uuid.uuid4())
-    ts  = time.time()
-    tags_json = json.dumps(tags or [])
-    CONN.execute(
-        "INSERT INTO memories(id, content, tags, ts) VALUES (?,?,?,?)",
-        (mid, content, tags_json, ts)
-    )
-    CONN.commit()
-    return mid
+# ---- 資料模型 ----
+class MemoryWrite(BaseModel):
+    content: str
+    tags: Optional[List[str]] = None
 
-def search_memory(q: str, top_k: int = 5) -> List[Dict[str, Any]]:
-    q_like = f"%{q}%"
-    rows = CONN.execute(
-        "SELECT id, content, tags, ts FROM memories "
-        "WHERE content LIKE ? OR tags LIKE ? "
-        "ORDER BY ts DESC LIMIT ?",
-        (q_like, q_like, top_k)
-    ).fetchall()
-    out = []
-    for rid, content, tags_json, ts in rows:
-        try:
-            tags = json.loads(tags_json) if tags_json else []
-        except Exception:
-            tags = []
-        out.append({"id": rid, "content": content, "tags": tags, "ts": ts})
-    return out
+class MemoryItem(BaseModel):
+    id: str
+    content: str
+    tags: List[str] = []
+    ts: float
 
-def health_ok() -> bool:
-    try:
-        CONN.execute("SELECT 1").fetchone()
-        return True
-    except Exception:
-        return False
+class ComposeRequest(BaseModel):
+    input: str
+    tags: Optional[List[str]] = None
+    top_k: int = 5
 
-# ---------- Routes ----------
-@app.get("/health")
+class ComposeResponse(BaseModel):
+    ok: bool
+    prompt: str
+    memories: List[MemoryItem] = []
+    output: str
+    ts: float
+
+# ---- 健康檢查 ----
+@app.get("/health", summary="Healthcheck")
 def health():
-    return {"ok": health_ok(), "ts": time.time()}
+    return {"ok": storage.health(), "ts": time.time()}
 
-@app.post("/memory/write")
-def memory_write(payload: Dict[str, Any], x_auth_token: Optional[str] = Header(None, alias="X-Auth-Token")):
-    must_auth(x_auth_token)
-    content = str(payload.get("content", "")).strip()
-    tags    = payload.get("tags") or []
-    if not content:
-        raise HTTPException(422, detail="content is required")
-    mid = add_memory(content, tags)
+# ---- 寫記憶 ----
+@app.post("/memory/write", summary="Memory Write")
+def memory_write(
+    body: MemoryWrite,
+    x_auth_token: Optional[str] = Header(None, convert_underscores=False),
+):
+    _check_token(x_auth_token)
+    mid = storage.add_memory(body.content, body.tags or [])
     return {"ok": True, "id": mid}
 
-@app.get("/memory/search")
+# ---- 搜記憶 ----
+@app.get("/memory/search", summary="Memory Search")
 def memory_search(
-    q: str = Query(""),
-    top_k: int = Query(5, ge=1, le=50),
-    x_auth_token: Optional[str] = Header(None, alias="X-Auth-Token")
+    q: str = Query("", description="查詢字串"),
+    top_k: int = Query(3, ge=1, le=20),
+    x_auth_token: Optional[str] = Header(None, convert_underscores=False),
 ):
-    must_auth(x_auth_token)
-    return {"results": search_memory(q, top_k)}
+    _check_token(x_auth_token)
+    rows = storage.search_memory(q=q, top_k=top_k)
+    return {"results": rows}
 
-@app.post("/compose")
-def compose(payload: Dict[str, Any], x_auth_token: Optional[str] = Header(None, alias="X-Auth-Token")):
-    must_auth(x_auth_token)
-    user_input = str(payload.get("input", "")).strip()
-    tags       = payload.get("tags") or []
-    top_k      = int(payload.get("top_k", 5))
+# ---- 新增：組合提示 +（可選）生成 ----
+@app.post("/compose", response_model=ComposeResponse, summary="Compose reply from persona + memory")
+def compose(
+    body: ComposeRequest,
+    x_auth_token: Optional[str] = Header(None, convert_underscores=False),
+):
+    _check_token(x_auth_token)
 
-    hits = search_memory(user_input, top_k)
-    mem_lines = []
-    for h in hits:
-        t = ",".join(h.get("tags") or [])
-        mem_lines.append(f"- [{t}] {h['content']}")
-    mem_block = "\n".join(mem_lines) if mem_lines else "(無相關記憶)"
+    # 1) 取相關記憶
+    mem_rows = storage.search_memory(q=body.input, top_k=body.top_k)
+    mem_items: List[MemoryItem] = []
+    for r in mem_rows:
+        mem_items.append(
+            MemoryItem(
+                id=r.get("id", ""),
+                content=r.get("content", ""),
+                tags=r.get("tags", []),
+                ts=r.get("ts", 0.0),
+            )
+        )
 
+    # 2) 人格模板（可自行調整成您固定語風）
     persona = (
-        "你是 OathLink 的專屬助理，必須保持穩定的語氣與邏輯。"
-        "使用敬語（稱呼對方為「師父」或「您」），回覆務實、有條理。"
+        "你是 OathLink 的助手，稱呼使用者為『師父』或『您』，"
+        "語氣尊重、清楚、步驟式，回答務必精簡可執行。"
     )
-    prompt = (
+
+    # 3) 將記憶轉成可注入的 context
+    memory_context_lines = []
+    for i, m in enumerate(mem_items, start=1):
+        t = ", ".join(m.tags) if m.tags else ""
+        memory_context_lines.append(f"{i}. {m.content}  [tags: {t}]")
+
+    memory_context = "\n".join(memory_context_lines) if memory_context_lines else "(無匹配記憶)"
+
+    # 4) 產生最終 Prompt（即使沒 OpenAI 也回傳，方便前端或鍵盤直接使用）
+    final_prompt = (
         f"{persona}\n\n"
-        f"【相關記憶】\n{mem_block}\n\n"
-        f"【使用者輸入】\n{user_input}\n\n"
-        f"請先給出直接可用的回覆（同時維持一貫的語風），必要時再列出後續步驟。"
+        f"【相關記憶】\n{memory_context}\n\n"
+        f"【使用者輸入】\n{body.input}\n\n"
+        f"請依人格模板，給出最精簡、可直接複製使用的回覆。"
     )
-    return {"ok": True, "prompt": prompt, "tags": tags, "top_k": top_k}
+
+    # 5) 可選：用 OpenAI 直接生成（如果有 API Key）
+    output_text = ""
+    if USE_OPENAI:
+        try:
+            resp = oai_client.chat.completions.create(
+                model=os.getenv("COMPOSE_MODEL", "gpt-4o-mini"),
+                messages=[
+                    {"role": "system", "content": persona},
+                    {"role": "user", "content": f"相關記憶：\n{memory_context}"},
+                    {"role": "user", "content": f"使用者輸入：\n{body.input}\n請直接給可複製的最終回覆。"},
+                ],
+                temperature=float(os.getenv("COMPOSE_TEMPERATURE", "0.4")),
+            )
+            output_text = resp.choices[0].message.content.strip()
+        except Exception as e:
+            # 若模型失敗，不阻斷；回傳 prompt 讓前端自行處理
+            output_text = f"(生成暫停：{e})"
+
+    return ComposeResponse(
+        ok=True,
+        prompt=final_prompt,
+        memories=mem_items,
+        output=output_text,
+        ts=time.time(),
+    )
