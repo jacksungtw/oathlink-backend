@@ -88,7 +88,7 @@ def memory_search(q: str = Query(...), top_k: int = Query(5), x_auth_token: str 
     hits = search_memory(q, top_k)
     return {"results": hits, "ok": True, "ts": time.time()}
 
-# 這就是您現在缺少的端點
+# 人格模板 + 記憶組合
 PERSONA = os.getenv("PERSONA_PROMPT", "你是 OathLink 助理，語氣穩定、精簡、禮貌，回覆使用者偏好。")
 @app.post("/compose")
 def compose(body: ComposeBody, x_auth_token: str | None = Header(default=None, alias="X-Auth-Token")):
