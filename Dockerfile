@@ -15,4 +15,4 @@ COPY . .
 EXPOSE 8000
 
 # 6) 關鍵：用 shell 形式展開 $PORT，避免看到 '$PORT is not a valid integer'
-CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port $PORT"]
+CMD sh -c "python -m uvicorn app:app --host 0.0.0.0 --port ${PORT:-8080}"
