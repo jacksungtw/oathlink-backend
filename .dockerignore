@@ -1,0 +1,30 @@
+# 忽略不必要檔案，加快 Docker build 並減少鏡像大小
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite
+*.sqlite3
+.env
+.env.*
+.vscode/
+.idea/
+*.log
+.DS_Store
+
+# Git 與本地暫存
+.git
+.gitignore
+*.swp
+*.swo
+*.tmp
+
+# 測試與文件
+tests/
+docs/
+README.md
+
+# 系統檔
+Thumbs.db
+ehthumbs.db
