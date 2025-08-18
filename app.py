@@ -1,108 +1,140 @@
-# app.py — OathLink Backend (含 /compose)
-import os
-import time
-from typing import List, Optional, Dict, Any
-
+# app.py — OathLink Backend (with /compose1 and /compose2 for test)
+import os, time, uuid, sqlite3
+from typing import List, Optional, Any, Dict
 from fastapi import FastAPI, Header, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
-# 連結既有儲存層（您 repo 已有 storage.py）
-from storage import add_memory, search_memory, health as storage_health
+# ---------- Config ----------
+DB_PATH = os.getenv("DB_PATH", "/app/data/memory.db")
+AUTH_TOKEN_ENV = os.getenv("AUTH_TOKEN")  # 若設定就啟用驗證
+PERSONA_PROMPT = (
+    "你是 OathLink 的『穩定語風人格助手』。"
+    "回覆語氣一致、條列清晰，會在必要時補上步驟與指令。"
+)
 
-app = FastAPI(title="OathLink Backend", version="1.0.0")
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
-# ====== 安全設定 ======
-AUTH_TOKEN = os.getenv("AUTH_TOKEN", "").strip()
+# ---------- DB helpers ----------
+def _conn():
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS memories (
+            id TEXT PRIMARY KEY,
+            content TEXT NOT NULL,
+            tags TEXT,
+            ts REAL NOT NULL
+        )
+    """)
+    return con
 
-def _check(token: Optional[str]) -> None:
-    if not AUTH_TOKEN:  # 未設定則視為關閉驗證（便於本機測試）
-        return
-    if not token or token.strip() != AUTH_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+def write_memory(content: str, tags: Optional[List[str]]) -> str:
+    mid = str(uuid.uuid4())
+    with _conn() as con:
+        con.execute(
+            "INSERT INTO memories (id, content, tags, ts) VALUES (?,?,?,?)",
+            (mid, content, ",".join(tags or []), time.time()),
+        )
+    return mid
 
-# ====== 資料模型 ======
+def search_memory(q: str, top_k: int) -> List[Dict[str, Any]]:
+    q = q.strip()
+    if not q:
+        return []
+    like = f"%{q}%"
+    with _conn() as con:
+        rows = con.execute(
+            """
+            SELECT id, content, tags, ts
+            FROM memories
+            WHERE content LIKE ? OR tags LIKE ?
+            ORDER BY ts DESC
+            LIMIT ?
+            """,
+            (like, like, int(top_k)),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+# ---------- FastAPI ----------
+app = FastAPI(title="OathLink Backend", version="0.1.0")
+
+def _check_auth(x_auth_token: Optional[str]):
+    if AUTH_TOKEN_ENV:
+        if not x_auth_token or x_auth_token != AUTH_TOKEN_ENV:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+# ---------- Schemas ----------
 class MemoryWrite(BaseModel):
-    content: str = Field(..., min_length=1)
+    content: str
     tags: Optional[List[str]] = None
 
 class ComposeReq(BaseModel):
-    input: str = Field(..., min_length=1)
+    input: str
     tags: Optional[List[str]] = None
     top_k: int = 5
 
-# ====== 固定人格模板 ======
-PERSONA_PROMPT = (
-    "你是 OathLink 的專屬助手，語氣穩定、尊敬、簡潔，稱呼用「師父／您／願主」。"
-    "請先結論後理由；不得使用不敬語；輸出採繁體中文。"
-)
+# ---------- Routes (health & memory) ----------
+@app.get("/health")
+def healthcheck():
+    return {"ok": True, "ts": time.time()}
 
-# ====== 健康檢查 ======
-@app.get("/health", summary="Healthcheck")
-def health():
-    ok = True
-    try:
-        ok = bool(storage_health())
-    except Exception:
-        ok = False
-    return {"ok": ok, "ts": time.time()}
-
-# ====== 記憶：寫入 ======
-@app.post("/memory/write", summary="Memory Write")
+@app.post("/memory/write")
 def memory_write(
     body: MemoryWrite,
     x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token"),
 ):
-    _check(x_auth_token)
-    mid = add_memory(body.content, body.tags or [])
-    return {"ok": True, "id": mid, "ts": time.time()}
+    _check_auth(x_auth_token)
+    mid = write_memory(body.content, body.tags)
+    return {"ok": True, "id": mid}
 
-# ====== 記憶：搜尋 ======
-@app.get("/memory/search", summary="Memory Search")
+@app.get("/memory/search")
 def memory_search(
     q: str = Query(..., min_length=1),
     top_k: int = Query(5, ge=1, le=100),
     x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token"),
 ):
-    _check(x_auth_token)
+    _check_auth(x_auth_token)
     hits = search_memory(q, top_k)
     return {"ok": True, "results": hits, "ts": time.time()}
 
-# ====== 組合：人格＋記憶（可選代叫 OpenAI） ======
-@app.post("/compose", summary="Compose with persona + memory")
-def compose(
+# ---------- Compose helper ----------
+def _compose_core(req: ComposeReq):
+    q = (" ".join(req.tags or []) + " " + req.input).strip()
+    hits = search_memory(q or req.input, req.top_k)
+    ctx_block = "\n".join([f"- {h['content']}" for h in hits]) or "（無匹配的過往記憶）"
+    user = f"【當前輸入】\n{req.input}\n\n【可用記憶】\n{ctx_block}"
+    prompt = f"{PERSONA_PROMPT}\n\n{user}\n\n請輸出最終回覆："
+    return {"prompt": prompt, "hits": hits}
+
+# ---------- Two compose endpoints for testing ----------
+@app.post("/compose1", summary="Compose (variant 1)")
+def compose1(
     req: ComposeReq,
     x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token"),
 ):
-    _check(x_auth_token)
+    _check_auth(x_auth_token)
+    data = _compose_core(req)
+    return {
+        "ok": True,
+        "variant": "compose1",
+        "prompt": data["prompt"],
+        "context_hits": data["hits"],
+        "output": "（compose1：本地拼接完成）",
+        "ts": time.time(),
+    }
 
-    # 1) 以「輸入＋標籤」組查詢並檢索記憶
-    q = (" ".join(req.tags or []) + " " + req.input).strip()
-    hits = search_memory(q or req.input, req.top_k)
-
-    ctx_block = "\n".join([f"- {h['content']}" for h in hits]) if hits else "（無匹配記憶）"
-
-    # 2) 最小可用 prompt（即使無模型也能回）
-    system = PERSONA_PROMPT
-    user = f"【當前輸入】\n{req.input}\n\n【可用記憶】\n{ctx_block}"
-    prompt = f"{system}\n\n{user}\n\n【請以人格口吻輸出】"
-
-    # 3) 若有 OPENAI_API_KEY，嘗試代叫；失敗不影響回傳
-    output: Optional[str] = None
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-    MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
-    if OPENAI_API_KEY:
-        try:
-            from openai import OpenAI  # pip install openai>=1
-            client = OpenAI(api_key=OPENAI_API_KEY)
-            resp = client.chat.completions.create(
-                model=MODEL,
-                messages=[{"role": "system", "content": system},
-                          {"role": "user", "content": user}],
-                temperature=0.3,
-            )
-            output = resp.choices[0].message.content
-        except Exception:
-            output = None  # 不中斷，回本地 prompt
-
-    return {"ok": True, "prompt": prompt, "model_output": output, "hits": hits, "ts": time.time()}
+@app.post("/compose2", summary="Compose (variant 2)")
+def compose2(
+    req: ComposeReq,
+    x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token"),
+):
+    _check_auth(x_auth_token)
+    data = _compose_core(req)
+    return {
+        "ok": True,
+        "variant": "compose2",
+        "prompt": data["prompt"],
+        "context_hits": data["hits"],
+        "output": "（compose2：本地拼接完成）",
+        "ts": time.time(),
+    }
