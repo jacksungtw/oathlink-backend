@@ -47,14 +47,40 @@ def health():
     return {"ok": ok, "ts": time.time()}
 
 # ====== 記憶：寫入 ======
-@app.post("/memory/write", summary="Memory Write")
-def memory_write(
-    body: MemoryWrite,
+@app.get("/memory/search", summary="Memory Search")
+def memory_search(
+    q: str = Query(..., min_length=1),
+    top_k: int = Query(5, ge=1, le=100),
     x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token"),
 ):
-    _check(x_auth_token)
-    mid = add_memory(body.content, body.tags or [])
-    return {"ok": True, "id": mid, "ts": time.time()}
+    # 若有設 AUTH_TOKEN 才會驗證
+    if AUTH_TOKEN and x_auth_token != AUTH_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    like = f"%{q.strip()}%"
+    con = sqlite3.connect(DB_PATH); con.row_factory = sqlite3.Row
+    con.execute("""CREATE TABLE IF NOT EXISTS memory(
+        id TEXT PRIMARY KEY, content TEXT NOT NULL, tags TEXT, ts REAL NOT NULL
+    )""")
+    rows = con.execute("""
+        SELECT id, content, tags, ts
+        FROM memory
+        WHERE content LIKE ? OR COALESCE(tags,'') LIKE ?
+        ORDER BY ts DESC
+        LIMIT ?
+    """, (like, like, int(top_k))).fetchall()
+    con.close()
+
+    results = []
+    for r in rows:
+        try:
+            tags = json.loads(r["tags"]) if r["tags"] else []
+        except Exception:
+            tags = (r["tags"] or "").split(",")
+        results.append({
+            "id": r["id"], "content": r["content"], "tags": tags, "ts": r["ts"],
+        })
+    return {"ok": True, "results": results, "ts": time.time()}
 
 # ====== 記憶：搜尋 ======
 @app.get("/memory/search", summary="Memory Search")
@@ -106,3 +132,27 @@ def compose(
             output = None  # 不中斷，回本地 prompt
 
     return {"ok": True, "prompt": prompt, "model_output": output, "hits": hits, "ts": time.time()}
+    # ===== 診斷：檢查兩張表是否有資料、列出最近 5 筆 =====
+import sqlite3, json, time, os
+from fastapi import APIRouter
+dbg = APIRouter()
+
+@dbg.get("/debug/peek")
+def debug_peek():
+    path = os.getenv("DB_PATH", "/app/data/memory.db")
+    out = {"db_path": path, "now": time.time()}
+    con = sqlite3.connect(path); con.row_factory = sqlite3.Row
+    def q(sql):
+        try:
+            cur = con.execute(sql); rows = [dict(r) for r in cur.fetchall()]
+            return rows
+        except Exception as e:
+            return {"error": str(e)}
+    out["count_memory"]   = q("SELECT COUNT(*) AS n FROM memory")
+    out["count_memories"] = q("SELECT COUNT(*) AS n FROM memories")
+    out["last5_memory"]   = q("SELECT id,content,tags,ts FROM memory ORDER BY ts DESC LIMIT 5")
+    out["last5_memories"] = q("SELECT id,content,tags,ts FROM memories ORDER BY ts DESC LIMIT 5")
+    con.close()
+    return out
+
+app.include_router(dbg)
