@@ -1,4 +1,6 @@
 # Dockerfile — 純建置；啟動交由 railway.json
+ARG BUILD_ID
+ENV BUILD_ID=${BUILD_ID}
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
