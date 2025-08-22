@@ -1,4 +1,5 @@
 # app.py — OathLink Backend (MVP 完成版)
+import unicodedata
 import os, time, json, uuid, sqlite3, pathlib
 from typing import Optional, List, Any, Dict
 from fastapi import FastAPI, Header, HTTPException, Query
@@ -71,7 +72,9 @@ def _search_memory(q: str, top_k: int) -> List[Dict[str, Any]]:
             tags = (r["tags"] or "").split(",")
         out.append({"id": r["id"], "content": r["content"], "tags": tags, "ts": r["ts"]})
     return out
-
+def _norm(s: Optional[str]) -> str:
+    # 全形半形/組合字正規化 + 小寫，讓「清單」「清單測試」都能穩定比對
+    return unicodedata.normalize("NFKC", (s or "")).lower()
 # ===== Auth =====
 def _check_auth(x_auth_token: Optional[str]):
     if AUTH_TOKEN and x_auth_token != AUTH_TOKEN:
