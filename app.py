@@ -1,6 +1,5 @@
-# app.py — OathLink Backend (MVP 完成版)
-import unicodedata
-import os, time, json, uuid, sqlite3, pathlib
+# app.py — OathLink Backend (MVP, fixed)
+import os, time, json, uuid, sqlite3, pathlib, traceback
 from typing import Optional, List, Any, Dict
 from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel
@@ -25,7 +24,7 @@ PERSONA_PROMPT = (
 # 確保 DB 目錄
 pathlib.Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 
-# ===== DB Helpers =====
+# ===== DB Helpers (FIX: 確保在模組頂層存在) =====
 def _conn():
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
     con.row_factory = sqlite3.Row
@@ -72,9 +71,7 @@ def _search_memory(q: str, top_k: int) -> List[Dict[str, Any]]:
             tags = (r["tags"] or "").split(",")
         out.append({"id": r["id"], "content": r["content"], "tags": tags, "ts": r["ts"]})
     return out
-def _norm(s: Optional[str]) -> str:
-    # 全形半形/組合字正規化 + 小寫，讓「清單」「清單測試」都能穩定比對
-    return unicodedata.normalize("NFKC", (s or "")).lower()
+
 # ===== Auth =====
 def _check_auth(x_auth_token: Optional[str]):
     if AUTH_TOKEN and x_auth_token != AUTH_TOKEN:
@@ -103,7 +100,7 @@ def root():
 @app.get("/routes", summary="List routes")
 def routes():
     from fastapi.routing import APIRoute
-    return sorted([f"{list(r.methods)[0]} {r.path}" for r in app.routes if isinstance(r, APIRoute)])
+    return sorted([f"{sorted(r.methods)[0]} {r.path}" for r in app.routes if isinstance(r, APIRoute)])
 
 @app.get("/health", summary="Healthcheck")
 def health():
