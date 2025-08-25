@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <title>OathLink 行動測試台</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 0; background:#f7f7f7; color:#222; }
+    header { padding: 16px; background:#222; color:#fff; }
+    h1 { margin:0; font-size: 20px; }
+    .muted { font-size: 14px; color:#ccc; }
+    main { padding: 16px; }
+    section.card { background:#fff; padding:12px; margin-bottom:16px; border-radius:6px; box-shadow:0 1px 3px rgba(0,0,0,0.1);}
+    label { font-weight:600; font-size:14px; display:block; margin-top:4px; }
+    input,textarea { width:100%; padding:6px; margin-top:2px; font-size:14px; }
+    textarea{min-height:60px; resize:vertical;}
+    button.btn { margin-right:6px; padding:6px 12px; border:0; border-radius:4px; cursor:pointer; }
+    button.accent{background:#0066cc; color:#fff;}
+    button.ok{background:#117a36; color:#fff;}
+    .row{display:flex;align-items:center;gap:6px;}
+    .grid{display:grid;gap:8px;}
+    .grid.two{grid-template-columns:1fr 1fr;}
+    pre{background:#eee; padding:6px; border-radius:4px; white-space:pre-wrap; word-break:break-word; font-size:13px;}
+    .pill{padding:2px 8px; border-radius:12px; font-size:12px;}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>OathLink 行動測試台</h1>
+    <div class="muted">可安裝到主畫面的 PWA，支援 /compose 與記憶 API。</div>
+  </header>
+  <main>
+    <!-- 連線設定 -->
+    <section class="card">
+      <div class="grid two">
+        <div>
+          <label>BASE（後端網址，含 https）</label>
+          <input id="base" placeholder="https://oathlink-backend-clean-production.up.railway.app">
+        </div>
+        <div>
+          <label>X-Auth-Token（如後端有設 AUTH_TOKEN，否則留空）</label>
+          <input id="token" placeholder="abc123（可留空）">
+        </div>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <button class="btn" id="btnHealth">健康檢查 /health</button>
+        <button class="btn" id="btnRoot">根路徑 /</button>
+        <span id="status" class="pill">Idle</span>
+      </div>
+      <pre id="outConn"></pre>
+    </section>
+
+    <!-- Compose -->
+    <section class="card">
+      <h3 style="margin:4px 0 8px;">🧪 /compose 即時測試</h3>
+      <div class="grid">
+        <div>
+          <label>問題 / 指令（input）</label>
+          <textarea id="compInput" placeholder="請條列三點進度，並標註下一步"></textarea>
+        </div>
+        <div class="grid two">
+          <div>
+            <label>Tags（以逗號分隔，可留空）</label>
+            <input id="compTags" placeholder="clean,demo">
+          </div>
+          <div>
+            <label>top_k</label>
+            <input id="compTopK" type="number" min="1" max="50" value="5">
+          </div>
+        </div>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <button class="btn accent" id="btnCompose">呼叫 /compose</button>
+        <button class="btn" id="btnShowPrompt">顯示 prompt（system/user）</button>
+      </div>
+      <div class="grid two" style="margin-top:8px;">
+        <div>
+          <label>回覆 output</label>
+          <pre id="outCompose"></pre>
+        </div>
+        <div>
+          <label>命中記憶（context_hits）</label>
+          <pre id="outHits"></pre>
+        </div>
+      </div>
+      <details style="margin-top:8px;">
+        <summary>Raw JSON</summary>
+        <pre id="outComposeRaw"></pre>
+      </details>
+    </section>
+
+    <!-- 記憶寫入／搜尋 -->
+    <section class="card">
+      <h3 style="margin:4px 0 8px;">🧠 記憶：寫入 / 搜尋</h3>
+      <div class="grid two">
+        <div>
+          <label>✍️ content</label>
+          <input id="mwContent" placeholder="輸入要寫入的內容，例如：宋永傑">
+          <label style="margin-top:6px;">Tags（逗號分隔，可留空）</label>
+          <input id="mwTags" placeholder="clean,demo">
+          <div class="row" style="margin-top:8px;">
+            <button class="btn ok" id="btnWrite">POST /memory/write</button>
+          </div>
+          <pre id="outWrite"></pre>
+        </div>
+        <div>
+          <label>🔎 q（搜尋關鍵字）</label>
+          <input id="msQ" placeholder="輸入要搜尋的字，例如：宋永傑">
+          <label style="margin-top:6px;">top_k</label>
+          <input id="msTopK" type="number" min="1" max="50" value="5">
+          <div class="row" style="margin-top:8px;">
+            <button class="btn" id="btnSearch">GET /memory/search</button>
+          </div>
+          <pre id="outSearch"></pre>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    // —— SW 註冊（PWA）
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('./service-worker.js').catch(()=>{});
+      });
+    }
+
+    const $ = (id)=>document.getElementById(id);
+    const state = {
+      get base(){ return $('base').value.trim(); },
+      get token(){ return $('token').value.trim(); },
+      headers(){
+        const h = { 'Content-Type':'application/json; charset=utf-8' };
+        if (this.token) h['X-Auth-Token'] = this.token;
+        return h;
+      }
+    };
+
+    function setStatus(txt, ok=true){
+      const el = $('status');
+      el.textContent = txt;
+      el.style.background = ok ? '#18341f' : '#3a1c1c';
+      el.style.color = ok ? '#aaf0b9' : '#ffb3b3';
+    }
+    function j(v){ return JSON.stringify(v, null, 2); }
+    function tagsToArr(s){ return (s||'').split(',').map(x=>x.trim()).filter(Boolean); }
+
+    // 健康檢查
+    $('btnHealth').onclick = async ()=>{
+      try{
+        const r = await fetch(`${state.base}/health`, { headers: state.headers() });
+        const data = await r.json();
+        $('outConn').textContent = j(data);
+        setStatus('OK', true);
+      }catch(e){
+        $('outConn').textContent = String(e);
+        setStatus('ERR', false);
+      }
+    };
+    $('btnRoot').onclick = async ()=>{
+      try{
+        const r = await fetch(`${state.base}/`, { headers: state.headers() });
+        const data = await r.json();
+        $('outConn').textContent = j(data);
+        setStatus('OK', true);
+      }catch(e){
+        $('outConn').textContent = String(e);
+        setStatus('ERR', false);
+      }
+    };
+
+    // /compose
+    let lastPrompt = null;
+    $('btnCompose').onclick = async ()=>{
+      const body = {
+        input: $('compInput').value.trim(),
+        tags: tagsToArr($('compTags').value),
+        top_k: parseInt($('compTopK').value||'5',10)
+      };
+      try{
+        const r = await fetch(`${state.base}/compose`, {
+          method:'POST', headers: state.headers(), body: JSON.stringify(body)
+        });
+        const data = await r.json();
+        lastPrompt = data.prompt || null;
+
+        $('outCompose').textContent = (data.output || '').trim();
+        $('outHits').textContent    = j(data.context_hits||[]);
+        $('outComposeRaw').textContent = j(data);
+        setStatus(`compose: ${data.ok?'OK':'ERR'}`, !!data.ok);
+      }catch(e){
+        $('outCompose').textContent = String(e);
+        setStatus('ERR', false);
+      }
+    };
+    $('btnShowPrompt').onclick = ()=>{
+      if(!lastPrompt){ alert('尚無 prompt，可先呼叫 /compose'); return; }
+      const s = [
+        '【system】\\n' + (lastPrompt.system || ''),
+        '【user】\\n'   + (lastPrompt.user || '')
+      ].join('\\n\\n');
+      const w = window.open('', '_blank');
+      w.document.write('<pre style="white-space:pre-wrap;word-break:break-word;">'+
+        (s.replace(/[&<>]/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[m])))+
+      '</pre>');
+      w.document.close();
+    };
+
+    // 記憶：寫入
+    $('btnWrite').onclick = async ()=>{
+      const body = {
+        content: $('mwContent').value.trim(),
+        tags: tagsToArr($('mwTags').value)
+      };
+      try{
+        const r = await fetch(`${state.base}/memory/write`, {
+          method:'POST', headers: state.headers(), body: JSON.stringify(body)
+        });
+        const data = await r.json();
+        $('outWrite').textContent = j(data);
+        setStatus(`write: ${data.ok?'OK':'ERR'}`, !!data.ok);
+      }catch(e){
+        $('outWrite').textContent = String(e);
+        setStatus('ERR', false);
+      }
+    };
+
+    // 記憶：搜尋
+    $('btnSearch').onclick = async ()=>{
+      const q = encodeURIComponent(($('msQ').value||'').trim());
+      const top_k = parseInt($('msTopK').value||'5',10);
+      try{
+        const url = `${state.base}/memory/search?q=${q}&top_k=${top_k}`;
+        const r   = await fetch(url, { headers: state.headers() });
+        const data= await r.json();
+        $('outSearch').textContent = j(data);
+        setStatus(`search: ${data.ok ? 'OK' : 'ERR'}`, !!data.ok);
+      }catch(e){
+        $('outSearch').textContent = String(e);
+        setStatus('ERR', false);
+      }
+    };
+  </script>
+</body>
+</html>
